@@ -10,8 +10,6 @@ API_HASH = os.environ["TG_API_HASH"]
 SESSION = os.environ["TG_SESSION"]
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"].strip()
-print("DEBUG key length:", len(GEMINI_KEY))
-print("DEBUG key starts/ends:", GEMINI_KEY[:4], GEMINI_KEY[-4:])
 TARGET_CHANNEL = os.environ["TARGET_CHANNEL"]
 SOURCE_CHANNEL = "fabrizioromanotg"
 
@@ -30,14 +28,18 @@ def save_last_id(msg_id):
 def translate_to_arabic(text):
     if not text:
         return ""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    headers = {
+        "x-goog-api-key": GEMINI_KEY,
+        "Content-Type": "application/json"
+    }
     prompt = (
         "أعد صياغة الخبر الرياضي التالي بالعربية الفصحى الصحفية الطبيعية، "
         "كأنه مكتوب أصلاً بالعربي وليس مترجماً، حافظ على كل الأسماء والأرقام والحقائق كما هي، "
         "بدون أي مقدمات أو تعليقات إضافية، فقط النص المعاد صياغته:\n\n" + text
     )
     body = {"contents": [{"parts": [{"text": prompt}]}]}
-    r = requests.post(url, json=body, timeout=30)
+    r = requests.post(url, json=body, headers=headers, timeout=30)
     r.raise_for_status()
     data = r.json()
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
