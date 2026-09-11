@@ -28,7 +28,7 @@ def save_last_id(msg_id):
 def translate_to_arabic(text):
     if not text:
         return ""
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent"
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
     headers = {
         "x-goog-api-key": GEMINI_KEY,
         "Content-Type": "application/json"
