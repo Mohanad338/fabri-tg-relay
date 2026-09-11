@@ -9,7 +9,9 @@ API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 SESSION = os.environ["TG_SESSION"]
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_KEY = os.environ["GEMINI_API_KEY"].strip()
+print("DEBUG key length:", len(GEMINI_KEY))
+print("DEBUG key starts/ends:", GEMINI_KEY[:4], GEMINI_KEY[-4:])
 TARGET_CHANNEL = os.environ["TARGET_CHANNEL"]
 SOURCE_CHANNEL = "fabrizioromanotg"
 
