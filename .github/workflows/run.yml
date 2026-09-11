@@ -1,0 +1,42 @@
+name: Fabri Relay
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install telethon requests
+
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: last_id.json
+          key: fabri-state
+
+      - name: Run relay script
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TARGET_CHANNEL: ${{ secrets.TARGET_CHANNEL }}
+        run: python main.py
+
+      - name: Save state
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: last_id.json
+          key: fabri-state
