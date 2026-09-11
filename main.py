@@ -28,7 +28,7 @@ def save_last_id(msg_id):
 def translate_to_arabic(text):
     if not text:
         return ""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_KEY}"
     prompt = (
         "أعد صياغة الخبر الرياضي التالي بالعربية الفصحى الصحفية الطبيعية، "
         "كأنه مكتوب أصلاً بالعربي وليس مترجماً، حافظ على كل الأسماء والأرقام والحقائق كما هي، "
