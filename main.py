@@ -40,6 +40,8 @@ def translate_to_arabic(text):
     )
     body = {"contents": [{"parts": [{"text": prompt}]}]}
     r = requests.post(url, json=body, headers=headers, timeout=30)
+    if r.status_code != 200:
+        print("FULL ERROR RESPONSE:", r.text)
     r.raise_for_status()
     data = r.json()
     return data["candidates"][0]["content"]["parts"][0]["text"].strip()
