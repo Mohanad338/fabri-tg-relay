@@ -50,10 +50,12 @@ def send_to_telegram(text, photo_path=None):
     if photo_path:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
         with open(photo_path, "rb") as f:
-            requests.post(url, data={"chat_id": TARGET_CHANNEL, "caption": text}, files={"photo": f}, timeout=30)
+            r = requests.post(url, data={"chat_id": TARGET_CHANNEL, "caption": text}, files={"photo": f}, timeout=30)
     else:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TARGET_CHANNEL, "text": text}, timeout=30)
+        r = requests.post(url, data={"chat_id": TARGET_CHANNEL, "text": text}, timeout=30)
+    print("TELEGRAM SEND STATUS:", r.status_code)
+    print("TELEGRAM SEND RESPONSE:", r.text)
 
 async def main():
     client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
@@ -64,6 +66,8 @@ async def main():
 
     messages = await client.get_messages(SOURCE_CHANNEL, min_id=last_id, limit=10)
     messages = list(reversed(messages))
+
+    print("DEBUG messages found:", len(messages))
 
     for msg in messages:
         text = msg.message or ""
