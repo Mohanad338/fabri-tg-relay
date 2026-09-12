@@ -25,26 +25,66 @@ def save_last_id(msg_id):
     with open(STATE_FILE, "w") as f:
         json.dump({"last_id": msg_id}, f)
 
-def translate_to_arabic(text):
+def process_with_gemini(text):
+    """
+    يرجع dict فيها:
+      - should_post: True/False
+      - text: النص المختصر بالعربي (فارغ لو should_post=False)
+    """
     if not text:
-        return ""
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent"
+        return {"should_post": False, "text": ""}
+
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent"
     headers = {
         "x-goog-api-key": GEMINI_KEY,
         "Content-Type": "application/json"
     }
+
     prompt = (
-        "أعد صياغة الخبر الرياضي التالي بالعربية الفصحى الصحفية الطبيعية، "
-        "كأنه مكتوب أصلاً بالعربي وليس مترجماً، حافظ على كل الأسماء والأرقام والحقائق كما هي، "
-        "بدون أي مقدمات أو تعليقات إضافية، فقط النص المعاد صياغته:\n\n" + text
+        "أنت محرر أخبار رياضية متخصص بأخبار الانتقالات لصحفي يدعى فابريزيو رومانو. "
+        "مهمتك تقييم المنشور التالي وإعادة صياغته إذا لزم.\n\n"
+        "قواعد النشر:\n"
+        "1. تغطية المباريات المباشرة (نتائج، أهداف، أحداث أثناء مباراة جارية، تشكيلات رسمية للمباراة) "
+        "تُنشر دائماً بالكامل بدون استثناء، تعتبر مهمة تلقائياً.\n"
+        "2. الأخبار الأخرى (انتقالات، تجديد عقود، تصريحات) تُنشر فقط إذا كانت مهمة فعلاً: "
+        "صفقة مؤكدة أو قريبة الاكتمال (Here We Go)، انتقال لاعب كبير أو نادي كبير، تصريح رسمي مباشر من مصدر موثوق داخل النادي، إصابة مؤثرة للاعب أساسي.\n"
+        "3. تُعتبر غير مهمة وتُرفض: شائعات مبكرة بدون مصدر رسمي، اهتمام أولي بدون تفاوض فعلي، أخبار تكهنات صحفية عامة، "
+        "تحديثات بسيطة لأخبار سبق نشرها بدون جديد حقيقي.\n\n"
+        "أعد النتيجة بصيغة JSON فقط بدون أي نص إضافي أو علامات markdown، بهذا الشكل بالضبط:\n"
+        '{"should_post": true أو false, "text": "النص المعاد صياغته بالعربية"}\n\n'
+        "شروط النص المعاد صياغته لو should_post=true:\n"
+        "- مختصر وواضح جداً، جملتين إلى ثلاث جمل كحد أقصى (إلا لو كان تغطية مباراة تفصيلية، حينها اختصر بدون حذف معلومة جوهرية).\n"
+        "- عربي فصيح صحفي طبيعي، كأنه مكتوب أصلاً بالعربي وليس ترجمة.\n"
+        "- احتفظ بكل الأسماء والأرقام والحقائق كما هي بدقة.\n"
+        "- بدون مقدمات أو تعليقات إضافية.\n\n"
+        "لو should_post=false، اجعل text فارغاً.\n\n"
+        "المنشور:\n" + text
     )
+
     body = {"contents": [{"parts": [{"text": prompt}]}]}
     r = requests.post(url, json=body, headers=headers, timeout=30)
     if r.status_code != 200:
         print("FULL ERROR RESPONSE:", r.text)
     r.raise_for_status()
     data = r.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+    # تنظيف احتمال وجود ```json``` حول النتيجة
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+
+    try:
+        result = json.loads(raw)
+        return {
+            "should_post": bool(result.get("should_post", False)),
+            "text": result.get("text", "").strip()
+        }
+    except json.JSONDecodeError:
+        print("JSON PARSE FAILED, raw response:", raw)
+        # في حال فشل التحليل، لا ننشر تحسباً بدل ما ننشر شي غير متوقع
+        return {"should_post": False, "text": ""}
 
 def send_to_telegram(text, photo_path=None):
     if photo_path:
@@ -71,10 +111,18 @@ async def main():
 
     for msg in messages:
         text = msg.message or ""
+
+        if msg.id > new_last_id:
+            new_last_id = msg.id
+
         if not text.strip():
             continue
 
-        translated = translate_to_arabic(text)
+        result = process_with_gemini(text)
+        print("DEBUG should_post:", result["should_post"], "| original len:", len(text))
+
+        if not result["should_post"] or not result["text"]:
+            continue
 
         photo_path = None
         if msg.media:
@@ -83,13 +131,12 @@ async def main():
             except Exception:
                 photo_path = None
 
-        send_to_telegram(translated, photo_path)
+        send_to_telegram(result["text"], photo_path)
 
         if photo_path and os.path.exists(photo_path):
             os.remove(photo_path)
 
-        if msg.id > new_last_id:
-            new_last_id = msg.id
+        await asyncio.sleep(2)  # تأخير بسيط بين الإرسالات لتفادي حد تلكرام عند تراكم عدة منشورات
 
     save_last_id(new_last_id)
     await client.disconnect()
