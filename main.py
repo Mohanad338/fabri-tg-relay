@@ -134,61 +134,54 @@ def send_to_telegram(text, photo_path=None):
     except Exception:
         return None
 
-def delete_from_telegram(message_id):
-    if not message_id:
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
-    r = requests.post(url, data={"chat_id": TARGET_CHANNEL, "message_id": message_id}, timeout=30)
-    print("TELEGRAM DELETE STATUS:", r.status_code, r.text)
-
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 state = {"last_id": load_last_id(), "hashes": load_posted_hashes()}
 
+# Serializes message handling so catch_up and the live handler can never
+# process two messages at the same instant (prevents double-processing races).
+process_lock = asyncio.Lock()
+
 async def handle_message(msg, client):
-    text = msg.message or ""
+    async with process_lock:
+        text = msg.message or ""
 
-    if msg.id > state["last_id"]:
-        state["last_id"] = msg.id
-        save_last_id(state["last_id"])
-        git_commit_state()
+        if msg.id > state["last_id"]:
+            state["last_id"] = msg.id
+            save_last_id(state["last_id"])
+            git_commit_state()
 
-    if not text.strip():
-        return
+        if not text.strip():
+            return
 
-    result = process_with_gemini(text)
-    print("DEBUG should_post:", result["should_post"], "| id:", msg.id)
+        # Hash the ORIGINAL source text, not the Gemini-rephrased output.
+        # Gemini's output is non-deterministic, so hashing its output let the
+        # same source message slip past dedup with a different hash each time.
+        h = text_hash(text)
+        if h in state["hashes"]:
+            print("DEBUG duplicate source, skipping:", msg.id)
+            return
 
-    if not result["should_post"] or not result["text"]:
-        return
+        result = process_with_gemini(text)
+        print("DEBUG should_post:", result["should_post"], "| id:", msg.id)
 
-    h = text_hash(result["text"])
-    if h in state["hashes"]:
-        print("DEBUG duplicate detected, skipping post:", msg.id)
-        return
+        if not result["should_post"] or not result["text"]:
+            return
 
-    photo_path = None
-    if msg.media:
-        try:
-            photo_path = await client.download_media(msg, file="temp_photo.jpg")
-        except Exception:
-            photo_path = None
+        photo_path = None
+        if msg.media:
+            try:
+                photo_path = await client.download_media(msg, file="temp_photo.jpg")
+            except Exception:
+                photo_path = None
 
-    sent_id = send_to_telegram(result["text"], photo_path)
+        send_to_telegram(result["text"], photo_path)
 
-    if h in state["hashes"]:
-        print("DEBUG race duplicate after send, deleting:", sent_id)
-        delete_from_telegram(sent_id)
-    else:
         state["hashes"].append(h)
         save_posted_hashes(state["hashes"])
         git_commit_state()
 
-    if photo_path and os.path.exists(photo_path):
-        os.remove(photo_path)
-
-@client.on(events.NewMessage(chats=SOURCE_CHANNEL))
-async def live_handler(event):
-    await handle_message(event.message, client)
+        if photo_path and os.path.exists(photo_path):
+            os.remove(photo_path)
 
 async def catch_up():
     last_id = load_last_id()
@@ -203,6 +196,14 @@ async def main():
     await client.start()
     await catch_up()
     print("DEBUG live listening started")
+
+    # Register the live handler only AFTER catch_up finishes, so backlog
+    # messages can never be picked up by both catch_up and the live listener
+    # at the same time (that race was the other source of duplicate posts).
+    async def live_handler(event):
+        await handle_message(event.message, client)
+
+    client.add_event_handler(live_handler, events.NewMessage(chats=SOURCE_CHANNEL))
 
     start_time = time.time()
     while time.time() - start_time < MAX_RUNTIME_SECONDS:
