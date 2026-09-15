@@ -16,8 +16,6 @@ TARGET_CHANNEL = os.environ["TARGET_CHANNEL"]
 SOURCE_CHANNEL = "fabrizioromanotg"
 
 STATE_FILE = "last_id.json"
-HASH_FILE = "posted_hashes.json"
-MAX_HASHES = 60
 MAX_RUNTIME_SECONDS = 5 * 3600 + 40 * 60
 
 def load_last_id():
@@ -30,16 +28,6 @@ def save_last_id(msg_id):
     with open(STATE_FILE, "w") as f:
         json.dump({"last_id": msg_id}, f)
 
-def load_posted_hashes():
-    if os.path.exists(HASH_FILE):
-        with open(HASH_FILE) as f:
-            return json.load(f).get("hashes", [])
-    return []
-
-def save_posted_hashes(hashes):
-    with open(HASH_FILE, "w") as f:
-        json.dump({"hashes": hashes[-MAX_HASHES:]}, f)
-
 def text_hash(text):
     normalized = " ".join(text.strip().split())
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -48,8 +36,8 @@ def git_commit_state():
     import subprocess
     subprocess.run(["git", "config", "user.name", "github-actions"])
     subprocess.run(["git", "config", "user.email", "actions@github.com"])
-    subprocess.run(["git", "add", "last_id.json", "posted_hashes.json"])
-    commit = subprocess.run(["git", "commit", "-m", "update state"], capture_output=True, text=True)
+    subprocess.run(["git", "add", "last_id.json"])
+    commit = subprocess.run(["git", "commit", "-m", "update last_id"], capture_output=True, text=True)
     print("GIT COMMIT:", commit.returncode, commit.stdout.strip(), commit.stderr.strip())
 
     for attempt in range(3):
@@ -59,7 +47,7 @@ def git_commit_state():
             return
         print(f"GIT PUSH attempt {attempt+1} FAILED:", push.stderr.strip())
         subprocess.run(["git", "pull", "--rebase", "--autostash"])
-    print("GIT PUSH: all attempts failed, state may not persist for this message")
+    print("GIT PUSH: all attempts failed")
 
 def process_with_gemini(text):
     if not text:
@@ -119,6 +107,19 @@ def process_with_gemini(text):
         print("JSON PARSE FAILED, raw response:", raw)
         return {"should_post": False, "text": ""}
 
+async def is_duplicate_in_channel(client, text):
+    target_hash = text_hash(text)
+    try:
+        recent = await client.get_messages(TARGET_CHANNEL, limit=30)
+    except Exception as e:
+        print("DEBUG could not fetch target channel history for dedup check:", e)
+        return False
+    for m in recent:
+        existing_text = m.message or m.raw_text or ""
+        if existing_text and text_hash(existing_text) == target_hash:
+            return True
+    return False
+
 def send_to_telegram(text, photo_path=None):
     if photo_path:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
@@ -134,54 +135,66 @@ def send_to_telegram(text, photo_path=None):
     except Exception:
         return None
 
-client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-state = {"last_id": load_last_id(), "hashes": load_posted_hashes()}
+def delete_from_telegram(message_id):
+    if not message_id:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+    r = requests.post(url, data={"chat_id": TARGET_CHANNEL, "message_id": message_id}, timeout=30)
+    print("TELEGRAM DELETE STATUS:", r.status_code, r.text)
 
-# Serializes message handling so catch_up and the live handler can never
-# process two messages at the same instant (prevents double-processing races).
-process_lock = asyncio.Lock()
+async def download_photo_with_retries(client, msg, attempts=4, delay_seconds=5):
+    for attempt in range(1, attempts + 1):
+        try:
+            photo_path = await client.download_media(msg, file="temp_photo.jpg")
+            if photo_path:
+                return photo_path
+        except Exception as e:
+            print(f"DEBUG photo download attempt {attempt} failed:", e)
+        if attempt < attempts:
+            await asyncio.sleep(delay_seconds)
+    return None
+
+client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
+state = {"last_id": load_last_id()}
 
 async def handle_message(msg, client):
-    async with process_lock:
-        text = msg.message or ""
+    text = msg.message or ""
 
-        if msg.id > state["last_id"]:
-            state["last_id"] = msg.id
-            save_last_id(state["last_id"])
-            git_commit_state()
-
-        if not text.strip():
-            return
-
-        # Hash the ORIGINAL source text, not the Gemini-rephrased output.
-        # Gemini's output is non-deterministic, so hashing its output let the
-        # same source message slip past dedup with a different hash each time.
-        h = text_hash(text)
-        if h in state["hashes"]:
-            print("DEBUG duplicate source, skipping:", msg.id)
-            return
-
-        result = process_with_gemini(text)
-        print("DEBUG should_post:", result["should_post"], "| id:", msg.id)
-
-        if not result["should_post"] or not result["text"]:
-            return
-
-        photo_path = None
-        if msg.media:
-            try:
-                photo_path = await client.download_media(msg, file="temp_photo.jpg")
-            except Exception:
-                photo_path = None
-
-        send_to_telegram(result["text"], photo_path)
-
-        state["hashes"].append(h)
-        save_posted_hashes(state["hashes"])
+    if msg.id > state["last_id"]:
+        state["last_id"] = msg.id
+        save_last_id(state["last_id"])
         git_commit_state()
 
-        if photo_path and os.path.exists(photo_path):
+    if not text.strip():
+        return
+
+    result = process_with_gemini(text)
+    print("DEBUG should_post:", result["should_post"], "| id:", msg.id)
+
+    if not result["should_post"] or not result["text"]:
+        return
+
+    photo_path = None
+    if msg.media:
+        photo_path = await download_photo_with_retries(client, msg)
+        if not photo_path:
+            print("DEBUG photo download failed after retries, skipping post (photo mandatory when source has one):", msg.id)
+            return
+
+    if await is_duplicate_in_channel(client, result["text"]):
+        print("DEBUG duplicate found in target channel, skipping post:", msg.id)
+        if photo_path:
             os.remove(photo_path)
+        return
+
+    send_to_telegram(result["text"], photo_path)
+
+    if photo_path and os.path.exists(photo_path):
+        os.remove(photo_path)
+
+@client.on(events.NewMessage(chats=SOURCE_CHANNEL))
+async def live_handler(event):
+    await handle_message(event.message, client)
 
 async def catch_up():
     last_id = load_last_id()
@@ -196,14 +209,6 @@ async def main():
     await client.start()
     await catch_up()
     print("DEBUG live listening started")
-
-    # Register the live handler only AFTER catch_up finishes, so backlog
-    # messages can never be picked up by both catch_up and the live listener
-    # at the same time (that race was the other source of duplicate posts).
-    async def live_handler(event):
-        await handle_message(event.message, client)
-
-    client.add_event_handler(live_handler, events.NewMessage(chats=SOURCE_CHANNEL))
 
     start_time = time.time()
     while time.time() - start_time < MAX_RUNTIME_SECONDS:
