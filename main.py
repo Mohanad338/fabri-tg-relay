@@ -2,6 +2,7 @@ import os
 import json
 import time
 import asyncio
+import hashlib
 import requests
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -15,7 +16,9 @@ TARGET_CHANNEL = os.environ["TARGET_CHANNEL"]
 SOURCE_CHANNEL = "fabrizioromanotg"
 
 STATE_FILE = "last_id.json"
-MAX_RUNTIME_SECONDS = 5 * 3600 + 40 * 60  # 5 ساعات و40 دقيقة، بأمان تحت حد GitHub (6 ساعات)
+HASH_FILE = "posted_hashes.json"
+MAX_HASHES = 60
+MAX_RUNTIME_SECONDS = 5 * 3600 + 40 * 60
 
 def load_last_id():
     if os.path.exists(STATE_FILE):
@@ -27,12 +30,36 @@ def save_last_id(msg_id):
     with open(STATE_FILE, "w") as f:
         json.dump({"last_id": msg_id}, f)
 
+def load_posted_hashes():
+    if os.path.exists(HASH_FILE):
+        with open(HASH_FILE) as f:
+            return json.load(f).get("hashes", [])
+    return []
+
+def save_posted_hashes(hashes):
+    with open(HASH_FILE, "w") as f:
+        json.dump({"hashes": hashes[-MAX_HASHES:]}, f)
+
+def text_hash(text):
+    normalized = " ".join(text.strip().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
 def git_commit_state():
-    os.system('git config user.name "github-actions"')
-    os.system('git config user.email "actions@github.com"')
-    os.system("git add last_id.json")
-    os.system('git diff --staged --quiet || git commit -m "update last_id"')
-    os.system("git push")
+    import subprocess
+    subprocess.run(["git", "config", "user.name", "github-actions"])
+    subprocess.run(["git", "config", "user.email", "actions@github.com"])
+    subprocess.run(["git", "add", "last_id.json", "posted_hashes.json"])
+    commit = subprocess.run(["git", "commit", "-m", "update state"], capture_output=True, text=True)
+    print("GIT COMMIT:", commit.returncode, commit.stdout.strip(), commit.stderr.strip())
+
+    for attempt in range(3):
+        push = subprocess.run(["git", "push"], capture_output=True, text=True)
+        if push.returncode == 0:
+            print("GIT PUSH: success")
+            return
+        print(f"GIT PUSH attempt {attempt+1} FAILED:", push.stderr.strip())
+        subprocess.run(["git", "pull", "--rebase", "--autostash"])
+    print("GIT PUSH: all attempts failed, state may not persist for this message")
 
 def process_with_gemini(text):
     if not text:
@@ -47,21 +74,23 @@ def process_with_gemini(text):
     prompt = (
         "أنت محرر أخبار رياضية متخصص بأخبار الانتقالات لصحفي يدعى فابريزيو رومانو. "
         "مهمتك تقييم المنشور التالي وإعادة صياغته إذا لزم.\n\n"
-        "قواعد النشر — تُنشر دائماً بدون استثناء (should_post=true تلقائياً) في هذي الحالات:\n"
-        "1. تغطية المباريات المباشرة (نتائج، أهداف، أحداث أثناء مباراة جارية، تشكيلات رسمية للمباراة).\n"
-        "2. نتيجة نهاية المباراة (Full-time / final score).\n"
+        "قواعد النشر — تُنشر دائماً بالكامل بدون استثناء (should_post=true تلقائياً) في هذي الحالات:\n"
+        "1. تغطية المباريات المباشرة بكل تفاصيلها: بداية المباراة، أهداف، أحداث أثناء اللعب، نهاية المباراة (Full-time / النتيجة النهائية).\n"
+        "2. التشكيلة الرسمية لمباراة (Starting XI / lineup).\n"
         "3. إحصائيات أداء لاعب بعد مباراة أو خلال فترة معينة (أهداف، تمريرات حاسمة، مساهمات تهديفية، أرقام قياسية).\n"
-        "4. أي منشور فيه عبارة \"Here We Go\" أو ما يعادلها (تأكيد اكتمال صفقة انتقال رسمياً).\n\n"
-        "لباقي الأخبار (شائعات، اهتمام أولي، مفاوضات جارية، تصريحات عامة)، انشرها فقط إذا كانت مهمة فعلاً: "
-        "صفقة قريبة الاكتمال، انتقال لاعب كبير أو نادي كبير، تصريح رسمي مباشر من مصدر موثوق داخل النادي، إصابة مؤثرة للاعب أساسي.\n"
-        "تُعتبر غير مهمة وتُرفض: شائعات مبكرة بدون مصدر رسمي، اهتمام أولي بدون تفاوض فعلي، تكهنات صحفية عامة، "
-        "تحديثات بسيطة لأخبار سبق نشرها بدون جديد حقيقي.\n\n"
+        "4. جائزة أو تصويت أفضل لاعب بالمباراة (Man of the Match / Player of the Match).\n"
+        "5. أي منشور فيه عبارة \"Here We Go\" أو ما يعادلها (تأكيد اكتمال صفقة انتقال رسمياً).\n\n"
+        "لباقي أخبار الانتقالات والتصريحات (غير المرتبطة بمباراة مباشرة)، كن متوسط التساهل لا متشدداً: "
+        "انشر أي خبر فيه تقدم حقيقي بصفقة (مفاوضات جدية، عرض رسمي، اقتراب من الاتفاق، اكتمال، تجديد عقد)، انتقال أو اهتمام بلاعب أو نادٍ معروف، "
+        "أو تصريح من مصدر داخل النادي أو من اللاعب نفسه، أو إصابة لاعب أساسي. "
+        "لا ترفض خبراً إلا إذا كان فعلاً سطحياً جداً: تكهنات صحفية عامة بدون أي مصدر أو تفاصيل، أو تكرار حرفي لخبر سبق نشره بدون أي جديد.\n\n"
         "أعد النتيجة بصيغة JSON فقط بدون أي نص إضافي أو علامات markdown، بهذا الشكل بالضبط:\n"
         '{"should_post": true أو false, "text": "النص المعاد صياغته بالعربية"}\n\n'
         "شروط النص المعاد صياغته لو should_post=true:\n"
         "- مختصر وواضح جداً، جملتين إلى ثلاث جمل كحد أقصى (إلا لو كان تغطية مباراة أو إحصائية تفصيلية، حينها اختصر بدون حذف معلومة جوهرية).\n"
         "- عربي فصيح صحفي طبيعي، كأنه مكتوب أصلاً بالعربي وليس ترجمة.\n"
         "- احتفظ بكل الأسماء والأرقام والحقائق كما هي بدقة.\n"
+        "- عبارة \"Here We Go\" تحديداً: اكتبها بالإنجليزي حرفياً كما هي داخل النص العربي، لا تترجمها أبداً إلى أي صيغة عربية.\n"
         "- بدون مقدمات أو تعليقات إضافية.\n\n"
         "لو should_post=false، اجعل text فارغاً.\n\n"
         "المنشور:\n" + text
@@ -100,9 +129,20 @@ def send_to_telegram(text, photo_path=None):
         r = requests.post(url, data={"chat_id": TARGET_CHANNEL, "text": text}, timeout=30)
     print("TELEGRAM SEND STATUS:", r.status_code)
     print("TELEGRAM SEND RESPONSE:", r.text)
+    try:
+        return r.json().get("result", {}).get("message_id")
+    except Exception:
+        return None
+
+def delete_from_telegram(message_id):
+    if not message_id:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage"
+    r = requests.post(url, data={"chat_id": TARGET_CHANNEL, "message_id": message_id}, timeout=30)
+    print("TELEGRAM DELETE STATUS:", r.status_code, r.text)
 
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-state = {"last_id": load_last_id()}
+state = {"last_id": load_last_id(), "hashes": load_posted_hashes()}
 
 async def handle_message(msg, client):
     text = msg.message or ""
@@ -121,6 +161,11 @@ async def handle_message(msg, client):
     if not result["should_post"] or not result["text"]:
         return
 
+    h = text_hash(result["text"])
+    if h in state["hashes"]:
+        print("DEBUG duplicate detected, skipping post:", msg.id)
+        return
+
     photo_path = None
     if msg.media:
         try:
@@ -128,18 +173,24 @@ async def handle_message(msg, client):
         except Exception:
             photo_path = None
 
-    send_to_telegram(result["text"], photo_path)
+    sent_id = send_to_telegram(result["text"], photo_path)
+
+    if h in state["hashes"]:
+        print("DEBUG race duplicate after send, deleting:", sent_id)
+        delete_from_telegram(sent_id)
+    else:
+        state["hashes"].append(h)
+        save_posted_hashes(state["hashes"])
+        git_commit_state()
 
     if photo_path and os.path.exists(photo_path):
         os.remove(photo_path)
 
 @client.on(events.NewMessage(chats=SOURCE_CHANNEL))
 async def live_handler(event):
-    # يعالج أي منشور جديد فوراً لحظة نزوله (لا انتظار)
     await handle_message(event.message, client)
 
 async def catch_up():
-    # يعالج أي منشورات فاتت أثناء توقف البوت بين تشغيلة والتالية
     last_id = load_last_id()
     messages = await client.get_messages(SOURCE_CHANNEL, min_id=last_id, limit=10)
     messages = list(reversed(messages))
